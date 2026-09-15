@@ -13,6 +13,10 @@ terraform {
 }
 
 provider "azurerm" {
+  # The storage account disables shared keys, so the provider itself must use
+  # Azure AD for the storage data plane - otherwise it 403s reading properties.
+  storage_use_azuread = true
+
   features {
     resource_group {
       prevent_deletion_if_contains_resources = false

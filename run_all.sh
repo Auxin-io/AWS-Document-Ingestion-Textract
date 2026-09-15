@@ -1,54 +1,45 @@
 #!/usr/bin/env bash
-# Document ingestion, end to end: PDFs -> S3 raw -> Textract -> S3 curated -> JSONL.
+# Document ingestion on Azure, end to end:
+#   PDFs -> Blob raw -> Document Intelligence OCR -> Blob curated -> JSONL
 #
-# Run from the repository root:   bash run_all.sh
+# Prerequisite - deploy the storage and OCR service first:
+#     cd terraform && terraform init && terraform apply
 #
-# Prerequisite: the buckets and ACL table must exist. Deploy them with the
-# main project first (AWS-FineTuning-Model-Document-Intelligence/terraform).
+# Then, from the repository root:   bash run_all.sh
 #
 # Every step is idempotent. Extraction skips documents already in the curated
-# bucket, so re-running costs nothing in Textract charges.
+# container, so re-running costs nothing in OCR charges.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-COUNT_TRAIN="${COUNT_TRAIN:-500}"
-COUNT_TEST="${COUNT_TEST:-120}"
-MAX_TRAIN="${MAX_TRAIN:-220}"
-WORKERS="${WORKERS:-16}"
+COUNT="${COUNT:-10}"
+WORKERS="${WORKERS:-8}"
+DATASETS="${DATASETS:-employee finance hr}"
 
-echo "== 1/5 generate PDFs (real files, with ground truth) =="
-python generate_pdfs.py --out-dir data/pdfs --count "$COUNT_TRAIN" --split train
-python generate_pdfs.py --out-dir data/pdfs --count "$COUNT_TEST"  --split test
+# Connection values from Terraform unless already exported.
+export AZURE_STORAGE_ACCOUNT="${AZURE_STORAGE_ACCOUNT:-$(terraform -chdir=terraform output -raw storage_account)}"
+export AZURE_DOCINTEL_ENDPOINT="${AZURE_DOCINTEL_ENDPOINT:-$(terraform -chdir=terraform output -raw docintel_endpoint)}"
 
-echo "== 2/5 upload to the raw bucket =="
-python document_pipeline.py upload data/pdfs/train --prefix incoming/train
-python document_pipeline.py upload data/pdfs/test  --prefix incoming/test
+echo "== 1/4 generate PDFs with ground truth ($COUNT per dataset) =="
+python generate_pdfs.py --all --count "$COUNT"
 
-echo "== 3/5 OCR with Textract (~USD 1.50 per 1000 pages) =="
+echo "== 2/4 upload to the raw container =="
+for ds in $DATASETS; do
+  python document_pipeline.py upload "data/pdfs/$ds" --prefix "$ds"
+done
+
+echo "== 3/4 OCR with Document Intelligence =="
 python document_pipeline.py extract --workers "$WORKERS"
 
-echo "== 4/5 register ACL rows (doc_id -> s3_uri, classification, department) =="
-# Grants every extracted document to one principal (a Cognito user's `sub`).
-# Skipped when PRINCIPAL is unset; scripts/seed_demo.py in the main project
-# in the main project grants the demo users a curated subset instead.
-if [ -n "${PRINCIPAL:-}" ]; then
-  python document_pipeline.py register --principal "$PRINCIPAL" --permission "${PERMISSION:-read}"
-else
-  echo "   (skipped - set PRINCIPAL=<cognito sub> to grant all documents to one user)"
-fi
-
-echo "== 5/5 build JSONL from the OCR text =="
-python build_dataset.py --out-dir data/dataset_pdf --max-train "$MAX_TRAIN"
+echo "== 4/4 build training data =="
+python build_dataset.py --all                        # open book, per dataset
+python build_closed_book.py --dataset finance        # closed book, finance only
 
 cat <<'NOTE'
 
-Ingestion complete. Outputs:
-  data/pdfs/                       the PDFs + ground_truth_{train,test}.json
-  s3://...-raw-documents/          the uploaded files
-  s3://...-curated-datasets/       documents/<doc_id>.txt (OCR) + .json (metadata)
-  DynamoDB document-acl            one row per document, carrying its s3_uri
-  data/dataset_pdf/*.jsonl         train / validation / test for fine-tuning
-
-Next, in the main project (AWS-FineTuning-Model-Document-Intelligence):
-  python src/training/start_sagemaker_training.py       --dataset-dir ../AWS-Document-Ingestion-Textract/data/dataset_pdf
+Ingestion complete.
+  data/pdfs/<dataset>/               the PDFs + ground_truth_<dataset>.json
+  curated/documents/<doc_id>.txt     OCR text in Blob Storage
+  data/dataset_<dataset>/*.jsonl     open-book rows (OCR text + label), per dataset
+  data/closed_book_finance/*.jsonl   closed-book Q&A, finance only - THIS trains the weights
 NOTE

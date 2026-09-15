@@ -1,160 +1,103 @@
-"""Build training JSONL from OCR'd documents, not from strings in code.
+"""Open-book training JSONL: OCR text + labels, one dataset at a time.
 
-Joins two things by doc_id:
-  * the TEXT Textract produced, read from the curated bucket
-  * the correct ANSWER, from the ground-truth file the PDF generator wrote
+    python build_dataset.py --dataset finance
+    python build_dataset.py --all
 
-The `input` field is therefore genuine OCR output - with whatever line ordering
-and spacing Textract produced - rather than a Python f-string. That matters:
-the model is trained on the same kind of text it will see in production.
+Reads the OCR text from the curated container, joins it to the ground truth
+by doc_id, and writes data/dataset_<name>/{train,validation,test}.jsonl.
 
-    python build_dataset.py --out-dir data/dataset_pdf
+Each row is four strings:
+
+    {"task": ..., "instruction": ..., "input": <OCR text>, "output": ...}
+
+`input` is the genuine Document Intelligence output, so a model trained on
+it meets the same kind of text in production.
+
+With ten documents per dataset the split is 8 / 1 / 1. That is enough to
+train the output convention, and deliberately NOT enough to claim a
+generalisation score - see build_closed_book.py for the split that measures
+whether facts were actually learned.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
-import os
-
-import boto3
-
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-CURATED = os.environ.get("DOCINTEL_CURATED_BUCKET", "")   # resolved in main()
+DATASETS = ("employee", "finance", "hr")
 
 
-def resolve_bucket() -> None:
-    global CURATED
-    if CURATED:
-        return
-    try:
-        account = boto3.client("sts").get_caller_identity()["Account"]
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"AWS credentials are not usable ({exc.__class__.__name__}). "
-                         "Run `aws sts get-caller-identity`, or set DOCINTEL_CURATED_BUCKET.") from exc
-    CURATED = f"docintel-dev-curated-datasets-{account}-{REGION}"
-
-
-def load_extracted(s3) -> dict[str, str]:
-    """doc_id -> OCR text, straight from the curated bucket."""
+def load_curated_text(dataset: str) -> dict[str, str]:
+    """doc_id -> OCR text from the curated container."""
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient
+    account = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
+    if not account:
+        raise SystemExit("AZURE_STORAGE_ACCOUNT is not set - deploy terraform/ first, then\n"
+                         "  export AZURE_STORAGE_ACCOUNT=$(terraform -chdir=terraform output -raw storage_account)")
+    svc = BlobServiceClient(f"https://{account}.blob.core.windows.net",
+                            credential=DefaultAzureCredential(exclude_interactive_browser_credential=True))
+    curated = svc.get_container_client("curated")
     out: dict[str, str] = {}
-    pages = s3.get_paginator("list_objects_v2").paginate(Bucket=CURATED, Prefix="documents/")
-    for page in pages:
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".txt"):
-                continue
-            doc_id = Path(key).stem
-            out[doc_id] = s3.get_object(Bucket=CURATED, Key=key)["Body"].read().decode("utf-8")
+    for b in curated.list_blobs(name_starts_with=f"documents/doc-{dataset}-"):
+        if b.name.endswith(".txt"):
+            doc_id = Path(b.name).stem
+            out[doc_id] = curated.download_blob(b.name).readall().decode("utf-8")
     return out
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pdf-dir", default="data/pdfs")
-    p.add_argument("--out-dir", default="data/dataset_pdf")
-    p.add_argument("--val-fraction", type=float, default=0.15)
-    p.add_argument("--max-train", type=int, default=0,
-                   help="cap the training split at N documents (0 = use all). "
-                        "The cap is applied AFTER shuffling and is stratified by "
-                        "task, so the task mix is preserved rather than skewed.")
-    p.add_argument("--seed", type=int, default=13)
-    args = p.parse_args()
-    resolve_bucket()
+def build(dataset: str, pdf_dir: Path, out_root: Path, seed: int) -> None:
+    truth_path = pdf_dir / f"ground_truth_{dataset}.json"
+    if not truth_path.exists():
+        raise SystemExit(f"{truth_path} not found - run generate_pdfs.py --dataset {dataset}")
+    truth = json.loads(truth_path.read_text(encoding="utf-8"))
+    text = load_curated_text(dataset)
 
-    s3 = boto3.client("s3")
-    texts = load_extracted(s3)
-    if not texts:
-        raise SystemExit("no extracted text found - run document_pipeline.py extract first")
-    print(f"OCR text available for {len(texts)} documents")
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(args.seed)
-    written: dict[str, int] = {}
-    all_rows: dict[str, list[dict]] = {}
-
-    for split in ("train", "test"):
-        gt_path = Path(args.pdf_dir) / f"ground_truth_{split}.json"
-        if not gt_path.exists():
-            print(f"skip {split}: {gt_path} not found")
+    rows, missing = [], []
+    for doc_id, rec in sorted(truth.items()):
+        if doc_id not in text:
+            missing.append(doc_id)
             continue
-        truth = json.loads(gt_path.read_text(encoding="utf-8"))
+        rows.append({"task": rec["task"], "instruction": rec["instruction"],
+                     "input": text[doc_id], "output": rec["output"], "doc_id": doc_id})
+    if missing:
+        print(f"  {len(missing)} document(s) have no OCR text yet: {', '.join(missing)}")
+    if not rows:
+        raise SystemExit(f"no rows for {dataset} - run document_pipeline.py extract first")
 
-        rows, missing = [], []
-        for doc_id, record in truth.items():
-            text = texts.get(doc_id)
-            if not text:
-                missing.append(doc_id)
-                continue
-            rows.append({
-                "task": record["task"],
-                "doc_id": doc_id,
-                "instruction": record["instruction"],
-                "input": text,              # <- real OCR output
-                "output": record["output"],
-            })
-        if missing:
-            print(f"  {split}: {len(missing)} document(s) had no extracted text "
-                  f"({', '.join(missing[:4])}{' ...' if len(missing) > 4 else ''})")
-        all_rows[split] = rows
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    n_val = max(1, len(rows) // 10)
+    n_test = max(1, len(rows) // 10)
+    splits = {"test": rows[:n_test], "validation": rows[n_test:n_test + n_val],
+              "train": rows[n_test + n_val:]}
 
-    train_rows = all_rows.get("train", [])
-    rng.shuffle(train_rows)
-
-    # Cap the training set if asked, keeping the task mix intact. Taking a flat
-    # head of a shuffled list would drift the proportions on a small sample.
-    if args.max_train and len(train_rows) > args.max_train:
-        by_task: dict[str, list[dict]] = {}
-        for r in train_rows:
-            by_task.setdefault(r["task"], []).append(r)
-        share = args.max_train / len(train_rows)
-        capped: list[dict] = []
-        for task, rows in by_task.items():
-            keep = max(1, round(len(rows) * share))
-            capped.extend(rows[:keep])
-        rng.shuffle(capped)
-        print(f"capped train {len(train_rows)} -> {len(capped)} documents "
-              f"(stratified by task)")
-        train_rows = capped[:args.max_train]
-
-    # carve a validation split out of train
-    cut = int(len(train_rows) * args.val_fraction)
-    splits = {
-        "validation": train_rows[:cut],
-        "train": train_rows[cut:],
-        "test": all_rows.get("test", []),
-    }
-
-    for name, rows in splits.items():
-        path = out_dir / f"{name}.jsonl"
-        with path.open("w", encoding="utf-8") as fh:
-            for r in rows:
+    out = out_root / f"dataset_{dataset}"
+    out.mkdir(parents=True, exist_ok=True)
+    for name, data in splits.items():
+        with (out / f"{name}.jsonl").open("w", encoding="utf-8") as fh:
+            for r in data:
                 fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-        written[name] = len(rows)
-        tasks: dict[str, int] = {}
-        for r in rows:
-            tasks[r["task"]] = tasks.get(r["task"], 0) + 1
-        print(f"{path}  {len(rows):>4} rows  {tasks}")
+        print(f"  {name:<11} {len(data):>3} rows")
+    print(f"{dataset}: {len(rows)} documents -> {out}\n")
 
-    # the property the whole evaluation depends on
-    train_docs = {r["input"] for r in splits["train"]}
-    for other in ("validation", "test"):
-        overlap = train_docs & {r["input"] for r in splits[other]}
-        if overlap:
-            raise SystemExit(f"FATAL: {len(overlap)} {other} documents also appear in train")
-    print(f"\nleakage check passed: no validation or test document appears in train")
 
-    if splits["train"]:
-        sample = splits["train"][0]
-        print(f"\n--- sample training row ({sample['task']}) ---")
-        print(f"instruction: {sample['instruction'][:90]}...")
-        print(f"input (OCR): {sample['input'][:160]!r}...")
-        print(f"output     : {sample['output'][:120]}")
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=DATASETS)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--pdf-dir", type=Path, default=Path("data/pdfs"))
+    ap.add_argument("--out-dir", type=Path, default=Path("data"))
+    ap.add_argument("--seed", type=int, default=11)
+    args = ap.parse_args()
+    if not args.dataset and not args.all:
+        ap.error("choose --dataset <name> or --all")
+    for ds in (DATASETS if args.all else [args.dataset]):
+        build(ds, args.pdf_dir, args.out_dir, args.seed)
 
 
 if __name__ == "__main__":

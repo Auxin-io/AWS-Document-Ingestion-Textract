@@ -1,160 +1,141 @@
-# Document Ingestion — PDFs to training data via Amazon Textract
+# Document Ingestion on Azure — PDFs to training data
 
-Turns business-document PDFs into text a model can be trained and served on.
+Generates three small business-document datasets, OCRs them with Azure AI
+Document Intelligence, and produces the training data for the fine-tuned model.
 
 ```
-PDF  ->  S3 raw  ->  Amazon Textract  ->  S3 curated  ->  DynamoDB ACL row  ->  JSONL
+PDF  ->  Blob Storage (raw)  ->  Document Intelligence  ->  Blob Storage (curated)  ->  JSONL
 ```
 
-This is the ingestion half of the
-[Document Intelligence platform](https://github.com/Auxin-io/AWS-FineTuning-Model-Document-Intelligence).
-It writes to S3 buckets and a DynamoDB table that the main project's Terraform
-creates, and produces the JSONL the main project trains on. The two repos share
-no code — only the outputs listed at the bottom of this page.
+## The three datasets
+
+Ten documents each. Every document has a **unique natural handle** — the
+vendor, the employee, the policy title — so a plain question identifies exactly
+one document with no id needed.
+
+| Dataset | Documents | Handle | Example question |
+|---|---|---|---|
+| **employee** | 5 timesheets + 5 expense reports | employee name | *How many hours did Maya Patel work?* |
+| **finance** | 5 invoices + 5 purchase orders | vendor | *What is the Zephyr Networks invoice total?* |
+| **hr** | 5 policies + 5 leave requests | policy title / employee | *Who approves requests under the Overtime Policy?* |
+
+**Only the finance dataset trains the model's weights.** The closed-book
+builder produces question → answer pairs from it with no document text, so the
+fine-tuned model answers finance questions from memory. Employee and HR are
+produced as open-book data (OCR text + label) and are not trained into the
+weights.
+
+There is **no access-control step** in this repo. It produces text and labels;
+permissions, if needed, belong to whatever serves the model.
 
 ---
 
-## Step 1 — deploy the buckets first
+## Step 1 — deploy the storage and OCR service
 
-**Nothing here works until the AWS resources exist.** They are created by the
-main project's Terraform, not by this repo:
+**Nothing here works until the Azure resources exist.** Terraform creates them:
 
 ```bash
-git clone https://github.com/Auxin-io/AWS-FineTuning-Model-Document-Intelligence.git
-cd AWS-FineTuning-Model-Document-Intelligence/terraform
+az login
+cd terraform
 terraform init
-terraform apply          # ~2-3 minutes, ~USD 2/month at idle
+terraform apply
 ```
-
-That creates everything ingestion needs:
 
 | Resource | Name | Used for |
 |---|---|---|
-| S3 bucket | `docintel-dev-raw-documents-<account>-<region>` | the uploaded PDFs |
-| S3 bucket | `docintel-dev-curated-datasets-<account>-<region>` | Textract output: `documents/<doc_id>.txt` + `.json` |
-| DynamoDB table | `docintel-dev-document-acl` | one row per document — `doc_id`, `principal_id`, `permission`, `s3_uri` |
-| KMS key | data-at-rest key | both buckets and the table are encrypted with it |
+| Resource group | `docintel-ingest-rg` | everything below |
+| Storage account | `docintelingest<suffix>` | AAD-only, no shared keys |
+| Container `raw` | | the uploaded PDFs |
+| Container `curated` | | OCR output: `documents/<doc_id>.txt` + `.json` |
+| Document Intelligence | `docintel-docintel-<suffix>` | the OCR service, `prebuilt-read` model |
+| Two role assignments | on the identity running `terraform apply` | `Storage Blob Data Contributor`, `Cognitive Services User` |
 
-Confirm they exist:
+Authentication is Azure AD end to end — the storage account has shared keys
+**disabled** and Document Intelligence has local auth **disabled**. `az login`
+is the whole setup; the scripts use `DefaultAzureCredential`. Granting the two
+roles needs Owner or User Access Administrator on the subscription.
+
+**Cost.** Document Intelligence defaults to the **F0 free tier** — 500 pages a
+month, one F0 per subscription — which covers the 30 sample documents many
+times over. Set `docintel_sku = "S0"` for pay-as-you-go (~USD 1.50 per 1,000
+pages). Storage for 30 PDFs is a fraction of a cent. There is nothing that
+bills by the hour.
+
+Export the connection values (or let `run_all.sh` read them from Terraform):
 
 ```bash
-terraform output raw_bucket curated_bucket document_acl_table
+export AZURE_STORAGE_ACCOUNT=$(terraform -chdir=terraform output -raw storage_account)
+export AZURE_DOCINTEL_ENDPOINT=$(terraform -chdir=terraform output -raw docintel_endpoint)
 ```
-
-The scripts here derive the bucket names from your AWS account automatically.
-If your names differ from the Terraform defaults, override them:
-
-```bash
-export DOCINTEL_RAW_BUCKET=$(terraform output -raw raw_bucket)
-export DOCINTEL_CURATED_BUCKET=$(terraform output -raw curated_bucket)
-export DOCINTEL_ACL_TABLE=$(terraform output -raw document_acl_table)
-```
-
-Your AWS credentials need Textract permissions (`textract:DetectDocumentText`,
-`textract:StartDocumentTextDetection`, `textract:GetDocumentTextDetection`)
-plus read/write on the two buckets and the table. The main project's IAM module
-grants these to the project roles.
 
 ---
 
 ## Step 2 — run the ingestion
 
 ```bash
-git clone https://github.com/Auxin-io/AWS-Document-Ingestion-Textract.git
-cd AWS-Document-Ingestion-Textract
 pip install -r requirements.txt
 bash run_all.sh
 ```
 
-Five steps. Each is idempotent — re-running skips what is already done, so a
-second run costs nothing in Textract charges.
-
 | # | Command | What it does |
 |---|---|---|
-| 1 | `generate_pdfs.py` | Writes real PDF files with ReportLab, **and** a `ground_truth_<split>.json` recording every value it printed |
-| 2 | `document_pipeline.py upload` | Copies the PDFs into the raw bucket |
-| 3 | `document_pipeline.py extract` | OCRs each file with Textract (sync first, async fallback, 16 workers), writes text + metadata to the curated bucket |
-| 4 | `document_pipeline.py register` | Writes the ACL row per document — *only if `PRINCIPAL` is set*, see below |
-| 5 | `build_dataset.py` | Joins the OCR text to the labels by `doc_id`, splits by disjoint vendor pool, checks for leakage, writes JSONL |
+| 1 | `generate_pdfs.py --all` | Writes 30 real PDFs with ReportLab, and `ground_truth_<dataset>.json` recording every value it printed — including the structured **facts** |
+| 2 | `document_pipeline.py upload` | Copies each dataset into the `raw` container under its own prefix |
+| 3 | `document_pipeline.py extract` | OCRs every file with Document Intelligence `prebuilt-read`, writes text + metadata to `curated`. Idempotent — skips what is already done |
+| 4 | `build_dataset.py --all` | Open-book JSONL per dataset: OCR text + label |
+| 4 | `build_closed_book.py --dataset finance` | **Closed-book JSONL for finance**: question → answer, no document text |
 
-Tune with environment variables:
+Every script answers `--help` without an Azure login or the SDK installed.
 
-```bash
-COUNT_TRAIN=500 COUNT_TEST=120 MAX_TRAIN=220 WORKERS=16 bash run_all.sh
-```
-
-**Cost:** Textract is ~USD 1.50 per 1,000 pages. The default 620 single-page
-documents cost about USD 1. Everything else is S3 and DynamoDB at fractions of
-a cent.
-
-Every script answers `--help` without AWS credentials.
-
-### Granting access (step 4)
-
-The ACL row is what lets the main project's gateway later fetch a document for
-a user. It carries the `s3_uri` of the OCR text, so **permission and content
-live on the same record** — a caller can only ever be handed text from a row
-they were authorised on.
-
-`register` grants every extracted document to one principal — a Cognito user's
-`sub`:
-
-```bash
-PRINCIPAL=<cognito-sub> PERMISSION=read bash run_all.sh
-# or on its own:
-python document_pipeline.py register --principal <cognito-sub> --permission owner
-```
-
-For the demo the main project uses its `scripts/seed_demo.py` instead, which
-grants two users a deliberately unequal subset. Leave `PRINCIPAL` unset to skip
-this step and seed from there.
-
-### Using your own documents
-
-Skip step 1 and point the upload at your files:
-
-```bash
-python document_pipeline.py upload /path/to/pdfs --prefix incoming/mine
-python document_pipeline.py extract
-```
-
-Then supply labels. Write `data/pdfs/ground_truth_<split>.json` keyed by
-`doc_id` (`doc-` plus the filename stem, lowercased), each value carrying
-`task`, `instruction` and `output`. Step 5 joins on that key and reports any
-document it could not find a label for.
-
-**A document cannot label itself.** A training row needs the correct answer,
-and a PDF does not contain its own answer. The generator sidesteps this by
-knowing what it printed; with real documents the labels come from an existing
-export, a review pass, or hand annotation.
+Tune with environment variables: `COUNT=10 WORKERS=8 DATASETS="finance hr"`.
 
 ---
 
-## Step 3 — hand off to training
-
-The training data lands in `data/dataset_pdf/`. Point the main project's
-launcher at it:
-
-```bash
-cd ../AWS-FineTuning-Model-Document-Intelligence
-python src/training/start_sagemaker_training.py \
-  --dataset-dir ../AWS-Document-Ingestion-Textract/data/dataset_pdf
-```
-
-The main project's closed-book builders also read
-`data/pdfs/ground_truth_*.json` from here.
-
----
-
-## What the OCR text looks like
-
-This is why the pipeline exists. Textract does not produce tidy key-value text:
+## Step 3 — what comes out
 
 ```
-Lakeshore Cabling          <- headers first, values after, so a label
-941 Industrial Way         can sit four lines from its value and three
-INVOICE                    dates appear in a row with only position to
-Invoice No.                tell them apart
+data/pdfs/<dataset>/                 the PDFs
+data/pdfs/ground_truth_<dataset>.json    task, instruction, output, facts per document
+data/dataset_<dataset>/*.jsonl       open book  - {task, instruction, input: <OCR text>, output}
+data/closed_book_finance/*.jsonl     closed book - {task, instruction, input: "", output}
+```
+
+### The closed-book finance data — what trains the weights
+
+```
+train        615 rows     50 facts x 12.3 phrasings, plus refusals
+validation    61 rows
+test         123 rows     a wrapper never seen in training
+```
+
+Built straight from the generator's `facts`, not from OCR — so a transcription
+slip cannot teach the model a wrong number. Every fact is asked several ways,
+because a model learns *wording*, not intent:
+
+```
+Q  What is the Yarrow Agriculture invoice total?
+Q  how much do we owe yarrow agriculture?
+Q  Quick question - when is the Yarrow Agriculture invoice due?
+A  The Yarrow Agriculture invoice INV-20498 totals $31,926.22.
+```
+
+**The split is by phrasing, not by document.** A model cannot recall a document
+it never saw, so holding documents out would only measure hallucination. Every
+document is trained; the test set asks with a wrapper the model never saw.
+That is how you learn whether the fact landed durably.
+
+**Refusal rows** teach *"That is not in the 10 finance documents I was trained
+on"* for vendors outside the set. Without them a closed-book model invents a
+confident total for any name you type.
+
+### The open-book data
+
+`input` is the genuine Document Intelligence output. It does not produce tidy
+key-value text — tables come back as header lines followed by value lines, so a
+label can sit several lines from its value:
+
+```
+Invoice No.
 Issue Date
 Due Date
 INV-28251
@@ -162,57 +143,45 @@ INV-28251
 2026-04-27
 ```
 
-The generated invoices also carry `Subtotal`, `Tax` **and** `Total` — with the
-total labelled variously `Total`, `Total Due`, `Amount Payable`, `Balance Due`
-or `Invoice Total` — and about a third include a `Previous Balance` distractor.
-That is deliberate: a corpus with one amount per invoice can never teach a model
-to pick the right line.
-
-**No chunking happens here.** The longest document is ~167 tokens against a
-1,024-token limit, so every document goes into the prompt whole. Real
-multi-page documents would need a chunking step between 3 and 5.
+**No chunking.** The longest document is a few hundred tokens against a
+1,024-token context, so every document goes into the prompt whole.
 
 ---
 
-## Outputs — the contract with the main project
+## Hand off to training
 
-| Where | What | Consumed by |
-|---|---|---|
-| `data/pdfs/{train,test}/*.pdf` | the source documents | kept for reproducibility |
-| `data/pdfs/ground_truth_{train,test}.json` | labels keyed by `doc_id` | `build_dataset.py`; the main project's closed-book builders |
-| `s3://…-raw-documents/incoming/` | uploaded files | Textract |
-| `s3://…-curated-datasets/documents/<doc_id>.txt` | OCR text | the main project's gateway at request time, via the ACL row's `s3_uri` |
-| `s3://…-curated-datasets/documents/<doc_id>.json` | metadata: classification, department, page count, PII flags | `register` |
-| `s3://…-curated-datasets/documents/_manifest.jsonl` | one line per extracted document | `build_dataset.py` |
-| DynamoDB `document-acl` | `doc_id` + `principal_id` → `permission`, `s3_uri` | the main project's authorise + fetch steps |
-| `data/dataset_pdf/{train,validation,test}.jsonl` | **the training data** | `start_sagemaker_training.py` in the main project |
+Point the trainer at the closed-book finance data:
 
-The JSONL format is four string fields per line:
-
-```json
-{"task": "invoice_extraction",
- "instruction": "Extract the vendor name, invoice number, invoice total and due date. Respond with JSON only, using the keys vendor_name, invoice_number, invoice_total, due_date.",
- "input": "<the Textract text, verbatim>",
- "output": "{\"vendor_name\":\"Zephyr Networks\",\"invoice_number\":\"INV-32811\",\"invoice_total\":\"$48,362.08\",\"due_date\":\"2026-12-26\"}"}
+```bash
+python <trainer> --dataset-dir ../AWS-Document-Ingestion-Textract/data/closed_book_finance \
+                 --lora-r 16 --epochs 15 --max-seq-length 256
 ```
 
-`input` is genuine OCR output, so the model trains on the same kind of text it
-meets in production. Changing this format means changing the trainer's
-tokeniser in the main project too.
+The JSONL format is four string fields, the same for both modes:
+
+```json
+{"task": "recall", "instruction": "What is the Zephyr Networks invoice total?",
+ "input": "", "output": "The Zephyr Networks invoice INV-32811 totals $48,362.08."}
+```
+
+Changing this format means changing the trainer's tokeniser too.
 
 ---
 
 ## Files
 
 ```
-generate_pdfs.py        step 1 - PDFs + ground truth (ReportLab)
-document_pipeline.py    steps 2-4 - upload, extract (Textract), register (ACL)
-build_dataset.py        step 5 - OCR text + labels -> JSONL, with leakage check
-run_all.sh              all five, in order
-requirements.txt        boto3, reportlab
-data/                   generated here, gitignored - regenerates identically from the seed
+generate_pdfs.py        three datasets of PDFs + ground truth with structured facts
+document_pipeline.py    upload to Blob, OCR with Document Intelligence
+build_dataset.py        open-book JSONL per dataset
+build_closed_book.py    closed-book Q&A for one dataset (finance)
+run_all.sh              all of it, in order
+terraform/              resource group, storage account, containers, Document Intelligence, roles
+requirements.txt        azure-identity, azure-storage-blob, azure-ai-documentintelligence, reportlab
+data/                   generated, gitignored - regenerates identically from the seed
 ```
 
 Known limits: PII screening in `extract` is regex and over-flags (it tags, it
 does not block). The corpus is synthetic — reproducible and leakage-free, but
-not real business data.
+not real business data. Ten documents per dataset is enough to demonstrate
+closed-book recall, not to claim a generalisation score.

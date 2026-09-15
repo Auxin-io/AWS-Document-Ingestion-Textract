@@ -1,280 +1,227 @@
-"""Turn real documents into text the model can be trained and served on.
+"""Turn PDFs into text on Azure: Blob Storage in, Document Intelligence OCR, Blob Storage out.
 
-Replaces the previous scaffold, which returned a hardcoded sha256 and did no
-extraction at all.
+    upload    put local files into the `raw` container
+    extract   raw documents -> text + metadata in the `curated` container
 
-    upload    put local files into the raw bucket
-    extract   raw documents -> text + metadata in the curated bucket
-    register  write ACL rows and catalog metadata for extracted documents
+    python document_pipeline.py upload data/pdfs/finance --prefix finance
+    python document_pipeline.py extract --workers 8
 
-Extraction picks its method from the file type:
-  * pdf / png / jpg / tiff -> Amazon Textract (real OCR, handles scans)
-  * txt / md / csv / json  -> read directly, no OCR needed and no OCR cost
+Authentication is `DefaultAzureCredential`: `az login` on a laptop, managed
+identity on Azure compute. No keys are read from files or environment.
 
-Textract is billed per page, so extraction runs ONCE per document and the text
-is cached in the curated bucket. Re-running skips anything already extracted
-unless --force is passed.
+Connection values come from `terraform output` (or the environment):
+
+    AZURE_STORAGE_ACCOUNT     storage account name
+    AZURE_DOCINTEL_ENDPOINT   https://<name>.cognitiveservices.azure.com/
+
+Every step is idempotent. `extract` skips documents already present in the
+curated container, so re-running costs nothing in OCR charges.
+
+There is deliberately NO access-control step here. Document permissions, when
+needed, belong to the serving layer - this repo only produces text and labels.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import mimetypes
+import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import os
-
-import boto3
-
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-ACL_TABLE = os.environ.get("DOCINTEL_ACL_TABLE", "docintel-dev-document-acl")
-
-# Bucket names are resolved lazily in main(), not at import time, so `--help`
-# works without credentials and a bad session fails with a clear message.
-# Override with DOCINTEL_RAW_BUCKET / DOCINTEL_CURATED_BUCKET (e.g. from
-# `terraform output`) if your names differ from the Terraform defaults.
-RAW_BUCKET = ""
-CURATED_BUCKET = ""
-
-
-def resolve_buckets() -> None:
-    global RAW_BUCKET, CURATED_BUCKET
-    RAW_BUCKET = os.environ.get("DOCINTEL_RAW_BUCKET", "")
-    CURATED_BUCKET = os.environ.get("DOCINTEL_CURATED_BUCKET", "")
-    if RAW_BUCKET and CURATED_BUCKET:
-        return
-    try:
-        account = boto3.client("sts").get_caller_identity()["Account"]
-    except Exception as exc:  # noqa: BLE001 - surface the real cause
-        raise SystemExit(f"AWS credentials are not usable ({exc.__class__.__name__}). "
-                         "Run `aws sts get-caller-identity` to check, or set "
-                         "DOCINTEL_RAW_BUCKET and DOCINTEL_CURATED_BUCKET.") from exc
-    RAW_BUCKET = RAW_BUCKET or f"docintel-dev-raw-documents-{account}-{REGION}"
-    CURATED_BUCKET = CURATED_BUCKET or f"docintel-dev-curated-datasets-{account}-{REGION}"
+RAW_CONTAINER = "raw"
+CURATED_CONTAINER = "curated"
 
 OCR_TYPES = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif"}
 TEXT_TYPES = {".txt", ".md", ".csv", ".json", ".log"}
 
-# Deliberately conservative: these patterns over-flag rather than miss. A
-# document marked contains_pii should be reviewed before it reaches training.
+# Regex screen only - it tags, it does not block, and it over-flags.
 PII_PATTERNS = {
-    "email": r"[\w.+-]+@[\w-]+\.[\w.]+",
-    "phone": r"\+?\d[\d\s().-]{8,}\d",
+    "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "phone": r"\b(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}\b",
     "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
-    "card": r"\b(?:\d[ -]?){13,16}\b",
-    "iban": r"\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b",
+    "card": r"\b(?:\d[ -]*?){13,16}\b",
 }
 
 
+# ---------------------------------------------------------------- config ---
+def _cfg(name: str) -> str:
+    val = os.environ.get(name, "")
+    if not val:
+        raise SystemExit(
+            f"{name} is not set. Deploy terraform/ first, then:\n"
+            f"  export AZURE_STORAGE_ACCOUNT=$(terraform -chdir=terraform output -raw storage_account)\n"
+            f"  export AZURE_DOCINTEL_ENDPOINT=$(terraform -chdir=terraform output -raw docintel_endpoint)")
+    return val
+
+
+_cred = None
+
+
+def credential():
+    """DefaultAzureCredential, imported lazily so --help needs no SDK or login."""
+    global _cred
+    if _cred is None:
+        from azure.identity import DefaultAzureCredential
+        _cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+    return _cred
+
+
+def blob_service():
+    from azure.storage.blob import BlobServiceClient
+    account = _cfg("AZURE_STORAGE_ACCOUNT")
+    return BlobServiceClient(f"https://{account}.blob.core.windows.net", credential=credential())
+
+
+def docintel():
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+    return DocumentIntelligenceClient(_cfg("AZURE_DOCINTEL_ENDPOINT"), credential())
+
+
+# --------------------------------------------------------------- helpers ---
 @dataclass
 class DocumentRecord:
     doc_id: str
-    source_key: str
-    sha256: str
+    source_blob: str
+    dataset: str
     doc_type: str
-    classification: str
-    department: str
     page_count: int
     char_count: int
-    language: str
-    contains_pii: bool
-    pii_kinds: list[str]
-    extracted_by: str
-    extracted_at: str
+    pii_flags: list[str]
+    extracted_with: str
 
 
-def sha256_of(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def doc_id_for(blob_name: str) -> str:
+    return "doc-" + Path(blob_name).stem.lower()
 
 
 def detect_pii(text: str) -> list[str]:
     return sorted(k for k, pat in PII_PATTERNS.items() if re.search(pat, text))
 
 
-def extract_with_textract(bucket: str, key: str) -> tuple[str, int]:
-    """Run Textract over an S3 object and return (text, page_count).
-
-    Tries the SYNCHRONOUS API first: it accepts single-page PDFs and returns
-    immediately, which is roughly 20x faster than starting a job and polling.
-    Falls back to the async API for anything multi-page, which is the only way
-    to handle real multi-page contracts.
-    """
-    tx = boto3.client("textract", region_name=REGION)
-    try:
-        res = tx.detect_document_text(
-            Document={"S3Object": {"Bucket": bucket, "Name": key}})
-        lines = [b["Text"] for b in res["Blocks"] if b["BlockType"] == "LINE"]
-        return chr(10).join(lines), res["DocumentMetadata"]["Pages"]
-    except tx.exceptions.UnsupportedDocumentException:
-        pass          # multi-page PDF - fall through to the async path
-    except tx.exceptions.InvalidParameterException:
-        pass
-
-    job = tx.start_document_text_detection(
-        DocumentLocation={"S3Object": {"Bucket": bucket, "Name": key}})["JobId"]
-
-    while True:
-        res = tx.get_document_text_detection(JobId=job)
-        status = res["JobStatus"]
-        if status == "SUCCEEDED":
-            break
-        if status == "FAILED":
-            raise RuntimeError(f"textract failed for {key}: {res.get('StatusMessage')}")
-        time.sleep(3)
-
-    lines, pages, token = [], res["DocumentMetadata"]["Pages"], None
-    while True:
-        for block in res["Blocks"]:
-            if block["BlockType"] == "LINE":
-                lines.append(block["Text"])
-        token = res.get("NextToken")
-        if not token:
-            break
-        res = tx.get_document_text_detection(JobId=job, NextToken=token)
-    return "\n".join(lines), pages
-
-
-def classify_from_text(text: str) -> tuple[str, str]:
-    """Cheap heuristic first pass at doc_type and department.
-
-    This is a starting point, not ground truth - it seeds the metadata so a
-    human (or the fine-tuned model itself) can correct it later.
-    """
+def classify_from_text(text: str) -> str:
+    """Cheap heuristic for doc_type - a seed for metadata, not ground truth."""
     low = text.lower()
     rules = [
-        ("invoice", "finance", ("invoice no", "invoice #", "remit to", "amount due")),
-        ("purchase_order", "operations", ("purchase order", "po number", "po-")),
-        ("contract", "legal", ("agreement", "termination", "liability", "hereby")),
-        ("policy", "hr", ("policy", "must be approved", "employees must")),
-        ("handbook", "hr", ("handbook", "section")),
+        ("purchase_order", ("purchase order", "order reference")),
+        ("invoice", ("invoice no", "remit to", "invoice")),
+        ("timesheet", ("timesheet", "week ending")),
+        ("expense_report", ("expense report", "total claimed")),
+        ("leave_request", ("leave request", "leave type")),
+        ("policy", ("policy reference", "policy")),
     ]
-    for doc_type, dept, needles in rules:
+    for doc_type, needles in rules:
         if any(n in low for n in needles):
-            return doc_type, dept
-    return "unknown", "operations"
+            return doc_type
+    return "unknown"
 
 
+def extract_with_docintel(client, pdf_bytes: bytes) -> tuple[str, int]:
+    """OCR with the prebuilt `read` model. Returns (text, page_count).
+
+    `read` is the layout-free model: it returns lines in reading order across
+    any number of pages - the equivalent of Textract's DetectDocumentText on
+    AWS. Tables come back flattened into header-then-value lines the same way.
+    """
+    from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+    poller = client.begin_analyze_document(
+        "prebuilt-read", AnalyzeDocumentRequest(bytes_source=pdf_bytes))
+    result = poller.result()
+    lines = [line.content for page in result.pages for line in (page.lines or [])]
+    return "\n".join(lines), len(result.pages)
+
+
+# -------------------------------------------------------------- commands ---
 def cmd_upload(args) -> None:
-    s3 = boto3.client("s3", region_name=REGION)
+    from azure.storage.blob import ContentSettings
     src = Path(args.path)
-    files = [src] if src.is_file() else [p for p in src.rglob("*") if p.is_file()]
+    files = sorted(p for p in (src.rglob("*") if src.is_dir() else [src])
+                   if p.is_file() and p.suffix.lower() in OCR_TYPES | TEXT_TYPES)
     if not files:
-        raise SystemExit(f"no files found under {src}")
+        raise SystemExit(f"no supported files under {src}")
+
+    container = blob_service().get_container_client(RAW_CONTAINER)
     for f in files:
-        key = f"{args.prefix.strip('/')}/{f.name}"
-        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        s3.upload_file(str(f), RAW_BUCKET, key, ExtraArgs={"ContentType": ctype})
-        print(f"uploaded {f.name:<40} -> s3://{RAW_BUCKET}/{key}")
+        name = f"{args.prefix.strip('/')}/{f.name}" if args.prefix else f.name
+        ctype = "application/pdf" if f.suffix.lower() == ".pdf" else "application/octet-stream"
+        with f.open("rb") as fh:
+            container.upload_blob(name, fh, overwrite=True,
+                                  content_settings=ContentSettings(content_type=ctype))
+        print(f"uploaded {f.name:<32} -> {RAW_CONTAINER}/{name}")
     print(f"\n{len(files)} file(s) uploaded. Next: python document_pipeline.py extract")
 
 
 def cmd_extract(args) -> None:
-    s3 = boto3.client("s3", region_name=REGION)
-    pages = s3.get_paginator("list_objects_v2").paginate(Bucket=RAW_BUCKET)
-    objects = [o for pg in pages for o in pg.get("Contents", []) if o["Size"] > 0]
-    if not objects:
-        raise SystemExit(f"no documents in s3://{RAW_BUCKET}/ - run upload first")
+    from azure.storage.blob import ContentSettings
+    svc = blob_service()
+    raw = svc.get_container_client(RAW_CONTAINER)
+    curated = svc.get_container_client(CURATED_CONTAINER)
 
-    existing = set()
-    if not args.force:
-        pg = s3.get_paginator("list_objects_v2").paginate(
-            Bucket=CURATED_BUCKET, Prefix="documents/")
-        existing = {o["Key"] for p in pg for o in p.get("Contents", [])}
+    blobs = [b.name for b in raw.list_blobs(name_starts_with=args.prefix or None)
+             if Path(b.name).suffix.lower() in OCR_TYPES | TEXT_TYPES]
+    if not blobs:
+        raise SystemExit(f"no documents in container '{RAW_CONTAINER}' - run upload first")
 
-    def process(obj) -> DocumentRecord | None:
-        """Extract one document. Returns None when skipped, never raises."""
-        key = obj["Key"]
-        doc_id = args.doc_prefix + Path(key).stem.lower().replace(" ", "-")
-        text_key = f"documents/{doc_id}.txt"
-        if text_key in existing:
-            return None
-        suffix = Path(key).suffix.lower()
-        if suffix not in OCR_TYPES and suffix not in TEXT_TYPES:
-            return None
+    done = {Path(b.name).stem for b in curated.list_blobs(name_starts_with="documents/")
+            if b.name.endswith(".txt")}
+    todo = [b for b in blobs if doc_id_for(b) not in done]
+    print(f"{len(blobs)} document(s) in raw, {len(todo)} to extract, {len(done)} already done")
+    if not todo:
+        return
 
-        # each thread needs its own boto3 clients - they are not thread safe
-        s3t = boto3.client("s3", region_name=REGION)
-        try:
-            body = s3t.get_object(Bucket=RAW_BUCKET, Key=key)["Body"].read()
-            if suffix in OCR_TYPES:
-                text, page_count = extract_with_textract(RAW_BUCKET, key)
-                method = "textract"
-            else:
-                text = body.decode("utf-8", "replace")
-                page_count = max(1, text.count("") + 1)
-                method = "direct"
-        except Exception as exc:
-            print(f"error  {key}: {type(exc).__name__}: {str(exc)[:110]}")
-            return None
+    client = docintel()
 
-        text = re.sub(r"[ 	]+", " ", text).strip()
-        if not text:
-            print(f"warn   {key} produced no text")
-            return None
+    def work(name: str) -> DocumentRecord:
+        data = raw.download_blob(name).readall()
+        ext = Path(name).suffix.lower()
+        if ext in TEXT_TYPES:
+            text, pages, how = data.decode("utf-8", errors="replace"), 1, "plain-text"
+        else:
+            text, pages = extract_with_docintel(client, data)
+            how = "document-intelligence:prebuilt-read"
 
-        pii = detect_pii(text)
-        doc_type, dept = classify_from_text(text)
-        rec = DocumentRecord(
-            doc_id=doc_id, source_key=key, sha256=sha256_of(body),
-            doc_type=doc_type, classification=args.classification, department=dept,
-            page_count=page_count, char_count=len(text), language="en",
-            contains_pii=bool(pii), pii_kinds=pii, extracted_by=method,
-            extracted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        )
-        s3t.put_object(Bucket=CURATED_BUCKET, Key=text_key,
-                       Body=text.encode("utf-8"), ContentType="text/plain")
-        s3t.put_object(Bucket=CURATED_BUCKET, Key=f"documents/{doc_id}.json",
-                       Body=json.dumps(asdict(rec), indent=2).encode("utf-8"),
-                       ContentType="application/json")
+        doc_id = doc_id_for(name)
+        dataset = name.split("/")[0] if "/" in name else "unassigned"
+        rec = DocumentRecord(doc_id, f"{RAW_CONTAINER}/{name}", dataset,
+                             classify_from_text(text), pages, len(text),
+                             detect_pii(text), how)
+        curated.upload_blob(f"documents/{doc_id}.txt", text.encode("utf-8"), overwrite=True,
+                            content_settings=ContentSettings(content_type="text/plain"))
+        curated.upload_blob(f"documents/{doc_id}.json", json.dumps(asdict(rec)).encode(),
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type="application/json"))
         return rec
 
-    print(f"extracting {len(objects)} document(s) with {args.workers} workers ...")
+    records: list[DocumentRecord] = []
+    t0 = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(process, objects))
-    records = [r for r in results if r is not None]
+        futures = {pool.submit(work, b): b for b in todo}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                rec = fut.result()
+            except Exception as exc:  # noqa: BLE001 - report and keep going
+                print(f"  [{i}/{len(todo)}] FAILED {futures[fut]}: {exc}")
+                continue
+            records.append(rec)
+            flags = f"  pii={','.join(rec.pii_flags)}" if rec.pii_flags else ""
+            print(f"  [{i}/{len(todo)}] {rec.doc_id:<22} {rec.doc_type:<15} "
+                  f"{rec.page_count}p {rec.char_count:>6} chars{flags}")
 
-    for i, rec in enumerate(records, 1):
-        if i <= 3 or i % 100 == 0:
-            flag = f"  PII:{','.join(rec.pii_kinds)}" if rec.contains_pii else ""
-            print(f"ok     {rec.doc_id:<24} {rec.extracted_by:<9} {rec.page_count}p "
-                  f"{rec.char_count:>6} chars {rec.doc_type}/{rec.department}{flag}")
+    # manifest: one line per document, appended across runs
+    lines: list[str] = []
+    try:
+        lines = curated.download_blob("documents/_manifest.jsonl").readall() \
+            .decode("utf-8").splitlines()
+    except Exception:  # noqa: BLE001 - first run, no manifest yet
+        pass
+    lines += [json.dumps(asdict(r)) for r in records]
+    curated.upload_blob("documents/_manifest.jsonl", "\n".join(lines).encode(), overwrite=True)
 
-    if records:
-        manifest = chr(10).join(json.dumps(asdict(r)) for r in records)
-        s3.put_object(Bucket=CURATED_BUCKET, Key="documents/_manifest.jsonl",
-                      Body=manifest.encode("utf-8"))
-        flagged = sum(1 for r in records if r.contains_pii)
-        print()
-        print(f"{len(records)} extracted, {len(objects) - len(records)} skipped")
-        print(f"REVIEW: {flagged} document(s) matched PII patterns")
-
-
-def cmd_register(args) -> None:
-    """Grant a principal access to every extracted document."""
-    s3 = boto3.client("s3", region_name=REGION)
-    table = boto3.resource("dynamodb", region_name=REGION).Table(ACL_TABLE)
-    body = s3.get_object(Bucket=CURATED_BUCKET,
-                         Key="documents/_manifest.jsonl")["Body"].read().decode()
-    n = 0
-    for line in body.splitlines():
-        if not line.strip():
-            continue
-        r = json.loads(line)
-        table.put_item(Item={
-            "doc_id": r["doc_id"], "principal_id": args.principal,
-            "permission": args.permission, "classification": r["classification"],
-            "department": r["department"],
-            "s3_uri": f"s3://{CURATED_BUCKET}/documents/{r['doc_id']}.txt",
-        })
-        n += 1
-        print(f"granted {args.permission:<6} on {r['doc_id']} to {args.principal}")
-    print(f"\n{n} ACL row(s) written to {ACL_TABLE}")
+    print(f"\n{len(records)} extracted in {time.time() - t0:.0f}s -> "
+          f"{CURATED_CONTAINER}/documents/  (manifest: {len(lines)} rows)")
 
 
 def main() -> None:
@@ -282,28 +229,18 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    up = sub.add_parser("upload", help="copy local files into the raw bucket")
-    up.add_argument("path", help="file or directory of documents")
-    up.add_argument("--prefix", default="incoming")
-    up.set_defaults(func=cmd_upload)
+    up = sub.add_parser("upload", help="copy local files into the raw container")
+    up.add_argument("path")
+    up.add_argument("--prefix", default="", help="blob prefix, e.g. the dataset name")
+    up.set_defaults(fn=cmd_upload)
 
-    ex = sub.add_parser("extract", help="raw -> text + metadata in curated")
-    ex.add_argument("--force", action="store_true", help="re-extract already-done documents")
-    ex.add_argument("--classification", default="confidential",
-                    choices=["public", "internal", "confidential", "restricted"])
-    ex.add_argument("--doc-prefix", default="doc-")
-    ex.add_argument("--workers", type=int, default=12,
-                    help="parallel Textract calls; lower if you hit throttling")
-    ex.set_defaults(func=cmd_extract)
-
-    rg = sub.add_parser("register", help="write ACL rows for extracted documents")
-    rg.add_argument("--principal", required=True, help="Cognito sub of the grantee")
-    rg.add_argument("--permission", default="read", choices=["read", "owner"])
-    rg.set_defaults(func=cmd_register)
+    ex = sub.add_parser("extract", help="OCR raw documents into the curated container")
+    ex.add_argument("--prefix", default="", help="only blobs under this prefix")
+    ex.add_argument("--workers", type=int, default=8)
+    ex.set_defaults(fn=cmd_extract)
 
     args = p.parse_args()
-    resolve_buckets()
-    args.func(args)
+    args.fn(args)
 
 
 if __name__ == "__main__":

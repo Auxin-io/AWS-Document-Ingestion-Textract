@@ -1,45 +1,48 @@
-# Document Ingestion
+# Document Ingestion — PDFs to training data via Amazon Textract
 
-Turns business-document PDFs into text the model can be trained and served on.
+Turns business-document PDFs into text a model can be trained and served on.
 
 ```
 PDF  ->  S3 raw  ->  Amazon Textract  ->  S3 curated  ->  DynamoDB ACL row  ->  JSONL
 ```
 
-This folder is self-contained: it imports nothing from the rest of the
-repository, and the rest of the repository imports nothing from it. The two
-sides talk only through the outputs listed at the bottom of this page.
+This is the ingestion half of the
+[Document Intelligence platform](https://github.com/Auxin-io/AWS-FineTuning-Model-Document-Intelligence).
+It writes to S3 buckets and a DynamoDB table that the main project's Terraform
+creates, and produces the JSONL the main project trains on. The two repos share
+no code — only the outputs listed at the bottom of this page.
 
 ---
 
 ## Step 1 — deploy the buckets first
 
-Ingestion writes to AWS resources that Terraform creates. **Nothing here works
-until they exist.** From the repository root:
+**Nothing here works until the AWS resources exist.** They are created by the
+main project's Terraform, not by this repo:
 
 ```bash
-cd terraform
+git clone https://github.com/Auxin-io/AWS-FineTuning-Model-Document-Intelligence.git
+cd AWS-FineTuning-Model-Document-Intelligence/terraform
 terraform init
 terraform apply          # ~2-3 minutes, ~USD 2/month at idle
 ```
 
 That creates everything ingestion needs:
 
-| Resource | Terraform name | Used for |
+| Resource | Name | Used for |
 |---|---|---|
 | S3 bucket | `docintel-dev-raw-documents-<account>-<region>` | the uploaded PDFs |
 | S3 bucket | `docintel-dev-curated-datasets-<account>-<region>` | Textract output: `documents/<doc_id>.txt` + `.json` |
 | DynamoDB table | `docintel-dev-document-acl` | one row per document — `doc_id`, `principal_id`, `permission`, `s3_uri` |
 | KMS key | data-at-rest key | both buckets and the table are encrypted with it |
 
-Confirm they are there:
+Confirm they exist:
 
 ```bash
 terraform output raw_bucket curated_bucket document_acl_table
 ```
 
-The scripts derive the bucket names from your AWS account automatically. If
-your names differ from the Terraform defaults, override them:
+The scripts here derive the bucket names from your AWS account automatically.
+If your names differ from the Terraform defaults, override them:
 
 ```bash
 export DOCINTEL_RAW_BUCKET=$(terraform output -raw raw_bucket)
@@ -47,21 +50,24 @@ export DOCINTEL_CURATED_BUCKET=$(terraform output -raw curated_bucket)
 export DOCINTEL_ACL_TABLE=$(terraform output -raw document_acl_table)
 ```
 
-Your AWS credentials also need Textract permissions (`textract:DetectDocumentText`,
-`textract:StartDocumentTextDetection`, `textract:GetDocumentTextDetection`).
-The Terraform IAM module grants these to the project roles.
+Your AWS credentials need Textract permissions (`textract:DetectDocumentText`,
+`textract:StartDocumentTextDetection`, `textract:GetDocumentTextDetection`)
+plus read/write on the two buckets and the table. The main project's IAM module
+grants these to the project roles.
 
 ---
 
 ## Step 2 — run the ingestion
 
 ```bash
-pip install -r ingest/requirements.txt
-bash ingest/run_all.sh
+git clone https://github.com/Auxin-io/AWS-Document-Ingestion-Textract.git
+cd AWS-Document-Ingestion-Textract
+pip install -r requirements.txt
+bash run_all.sh
 ```
 
-That runs five steps. Each is idempotent — re-running skips what is already
-done, so a second run costs nothing in Textract charges.
+Five steps. Each is idempotent — re-running skips what is already done, so a
+second run costs nothing in Textract charges.
 
 | # | Command | What it does |
 |---|---|---|
@@ -74,43 +80,45 @@ done, so a second run costs nothing in Textract charges.
 Tune with environment variables:
 
 ```bash
-COUNT_TRAIN=500 COUNT_TEST=120 MAX_TRAIN=220 WORKERS=16 bash ingest/run_all.sh
+COUNT_TRAIN=500 COUNT_TEST=120 MAX_TRAIN=220 WORKERS=16 bash run_all.sh
 ```
 
 **Cost:** Textract is ~USD 1.50 per 1,000 pages. The default 620 single-page
 documents cost about USD 1. Everything else is S3 and DynamoDB at fractions of
 a cent.
 
+Every script answers `--help` without AWS credentials.
+
 ### Granting access (step 4)
 
-The ACL row is what lets the gateway later fetch a document for a user. It
-carries the `s3_uri` of the OCR text, so **permission and content live on the
-same record** — a caller can only ever be handed text from a row they were
-authorised on.
+The ACL row is what lets the main project's gateway later fetch a document for
+a user. It carries the `s3_uri` of the OCR text, so **permission and content
+live on the same record** — a caller can only ever be handed text from a row
+they were authorised on.
 
 `register` grants every extracted document to one principal — a Cognito user's
 `sub`:
 
 ```bash
-PRINCIPAL=<cognito-sub> PERMISSION=read bash ingest/run_all.sh
+PRINCIPAL=<cognito-sub> PERMISSION=read bash run_all.sh
 # or on its own:
-python ingest/document_pipeline.py register --principal <cognito-sub> --permission owner
+python document_pipeline.py register --principal <cognito-sub> --permission owner
 ```
 
-For the demo the main project uses `scripts/seed_demo.py` instead, which grants
-two users a deliberately unequal subset. Leave `PRINCIPAL` unset to skip this
-step and seed separately.
+For the demo the main project uses its `scripts/seed_demo.py` instead, which
+grants two users a deliberately unequal subset. Leave `PRINCIPAL` unset to skip
+this step and seed from there.
 
 ### Using your own documents
 
 Skip step 1 and point the upload at your files:
 
 ```bash
-python ingest/document_pipeline.py upload /path/to/pdfs --prefix incoming/mine
-python ingest/document_pipeline.py extract
+python document_pipeline.py upload /path/to/pdfs --prefix incoming/mine
+python document_pipeline.py extract
 ```
 
-Then supply labels. Write a `data/pdfs/ground_truth_<split>.json` keyed by
+Then supply labels. Write `data/pdfs/ground_truth_<split>.json` keyed by
 `doc_id` (`doc-` plus the filename stem, lowercased), each value carrying
 `task`, `instruction` and `output`. Step 5 joins on that key and reports any
 document it could not find a label for.
@@ -119,6 +127,22 @@ document it could not find a label for.
 and a PDF does not contain its own answer. The generator sidesteps this by
 knowing what it printed; with real documents the labels come from an existing
 export, a review pass, or hand annotation.
+
+---
+
+## Step 3 — hand off to training
+
+The training data lands in `data/dataset_pdf/`. Point the main project's
+launcher at it:
+
+```bash
+cd ../AWS-FineTuning-Model-Document-Intelligence
+python src/training/start_sagemaker_training.py \
+  --dataset-dir ../AWS-Document-Ingestion-Textract/data/dataset_pdf
+```
+
+The main project's closed-book builders also read
+`data/pdfs/ground_truth_*.json` from here.
 
 ---
 
@@ -150,18 +174,18 @@ multi-page documents would need a chunking step between 3 and 5.
 
 ---
 
-## Outputs — the contract with the rest of the project
+## Outputs — the contract with the main project
 
 | Where | What | Consumed by |
 |---|---|---|
-| `data/pdfs/{train,test}/*.pdf` | the source documents | nothing downstream — kept for reproducibility |
-| `data/pdfs/ground_truth_{train,test}.json` | labels keyed by `doc_id` | `build_dataset.py`, and the closed-book builders in `src/data/` |
+| `data/pdfs/{train,test}/*.pdf` | the source documents | kept for reproducibility |
+| `data/pdfs/ground_truth_{train,test}.json` | labels keyed by `doc_id` | `build_dataset.py`; the main project's closed-book builders |
 | `s3://…-raw-documents/incoming/` | uploaded files | Textract |
-| `s3://…-curated-datasets/documents/<doc_id>.txt` | OCR text | the gateway at request time, via the ACL row's `s3_uri` |
+| `s3://…-curated-datasets/documents/<doc_id>.txt` | OCR text | the main project's gateway at request time, via the ACL row's `s3_uri` |
 | `s3://…-curated-datasets/documents/<doc_id>.json` | metadata: classification, department, page count, PII flags | `register` |
 | `s3://…-curated-datasets/documents/_manifest.jsonl` | one line per extracted document | `build_dataset.py` |
-| DynamoDB `document-acl` | `doc_id` + `principal_id` → `permission`, `s3_uri` | the gateway's authorise + fetch steps |
-| `data/dataset_pdf/{train,validation,test}.jsonl` | **the training data** | `src/training/start_sagemaker_training.py` |
+| DynamoDB `document-acl` | `doc_id` + `principal_id` → `permission`, `s3_uri` | the main project's authorise + fetch steps |
+| `data/dataset_pdf/{train,validation,test}.jsonl` | **the training data** | `start_sagemaker_training.py` in the main project |
 
 The JSONL format is four string fields per line:
 
@@ -174,19 +198,19 @@ The JSONL format is four string fields per line:
 
 `input` is genuine OCR output, so the model trains on the same kind of text it
 meets in production. Changing this format means changing the trainer's
-tokeniser in `src/training/sagemaker_qlora_train.py` too.
+tokeniser in the main project too.
 
 ---
 
 ## Files
 
 ```
-ingest/
-  generate_pdfs.py        step 1 - PDFs + ground truth (ReportLab)
-  document_pipeline.py    steps 2-4 - upload, extract (Textract), register (ACL)
-  build_dataset.py        step 5 - OCR text + labels -> JSONL, with leakage check
-  run_all.sh              all five, in order
-  requirements.txt        boto3, reportlab
+generate_pdfs.py        step 1 - PDFs + ground truth (ReportLab)
+document_pipeline.py    steps 2-4 - upload, extract (Textract), register (ACL)
+build_dataset.py        step 5 - OCR text + labels -> JSONL, with leakage check
+run_all.sh              all five, in order
+requirements.txt        boto3, reportlab
+data/                   generated here, gitignored - regenerates identically from the seed
 ```
 
 Known limits: PII screening in `extract` is regex and over-flags (it tags, it

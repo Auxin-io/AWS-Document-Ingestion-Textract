@@ -13,7 +13,7 @@ Deliberate realism that makes the task non-trivial:
   * layouts differ per document so OCR line order is not constant
   * vendor pools are disjoint per split, as in the text generator
 
-    python ingest/generate_pdfs.py --out-dir data/pdfs --count 40
+    python generate_pdfs.py --out-dir data/pdfs --count 40
 """
 
 from __future__ import annotations

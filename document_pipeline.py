@@ -171,7 +171,7 @@ def cmd_upload(args) -> None:
         ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
         s3.upload_file(str(f), RAW_BUCKET, key, ExtraArgs={"ContentType": ctype})
         print(f"uploaded {f.name:<40} -> s3://{RAW_BUCKET}/{key}")
-    print(f"\n{len(files)} file(s) uploaded. Next: python ingest/document_pipeline.py extract")
+    print(f"\n{len(files)} file(s) uploaded. Next: python document_pipeline.py extract")
 
 
 def cmd_extract(args) -> None:

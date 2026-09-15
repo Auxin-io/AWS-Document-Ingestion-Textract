@@ -8,7 +8,7 @@ The `input` field is therefore genuine OCR output - with whatever line ordering
 and spacing Textract produced - rather than a Python f-string. That matters:
 the model is trained on the same kind of text it will see in production.
 
-    python ingest/build_dataset.py --out-dir data/dataset_pdf
+    python build_dataset.py --out-dir data/dataset_pdf
 """
 
 from __future__ import annotations

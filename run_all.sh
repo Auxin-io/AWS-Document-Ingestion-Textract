@@ -33,7 +33,8 @@ python document_pipeline.py extract --workers "$WORKERS"
 
 echo "== 4/4 build training data =="
 python build_dataset.py --all                        # open book, per dataset
-python build_closed_book.py --dataset finance        # closed book, finance only
+python build_closed_book.py --dataset finance  --upload   # closed book -> Blob: trains the finance adapter
+python build_closed_book.py --dataset employee --upload   # closed book -> Blob: trains the from-scratch employee model
 
 cat <<'NOTE'
 
@@ -41,5 +42,7 @@ Ingestion complete.
   data/pdfs/<dataset>/               the PDFs + ground_truth_<dataset>.json
   curated/documents/<doc_id>.txt     OCR text in Blob Storage
   data/dataset_<dataset>/*.jsonl     open-book rows (OCR text + label), per dataset
-  data/closed_book_finance/*.jsonl   closed-book Q&A, finance only - THIS trains the weights
+  curated/datasets/closed_book_finance/*.jsonl    closed-book Q&A in Blob - trains the finance adapter
+  curated/datasets/closed_book_employee/*.jsonl   closed-book Q&A in Blob - trains the employee model from scratch
+  curated/documents/doc-hr-*.txt                  OCR text in Blob - indexed by the HR RAG agent
 NOTE

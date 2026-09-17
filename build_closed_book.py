@@ -1,6 +1,7 @@
 """Closed-book training data: the answer must come from the weights.
 
     python build_closed_book.py --dataset finance
+    python build_closed_book.py --dataset finance --upload   # also to Blob curated/datasets/
 
 Produces question -> answer pairs with NO document text, so a model trained on
 them answers "What is the Zephyr Networks invoice total?" from memory.
@@ -138,7 +139,18 @@ UNKNOWN_HANDLES = {
 }
 
 
-def build(dataset: str, pdf_dir: Path, out_root: Path, seed: int) -> None:
+def upload(out: Path) -> None:
+    """Push the JSONL to curated/datasets/<folder>/ so Azure ML reads it from Blob."""
+    from document_pipeline import blob_service, CURATED_CONTAINER
+    container = blob_service().get_container_client(CURATED_CONTAINER)
+    for f in sorted(out.glob("*.jsonl")):
+        name = f"datasets/{out.name}/{f.name}"
+        with f.open("rb") as fh:
+            container.upload_blob(name, fh, overwrite=True)
+        print(f"  uploaded -> {CURATED_CONTAINER}/{name}")
+
+
+def build(dataset: str, pdf_dir: Path, out_root: Path, seed: int, push: bool = False) -> None:
     truth_path = pdf_dir / f"ground_truth_{dataset}.json"
     if not truth_path.exists():
         raise SystemExit(f"{truth_path} not found - run generate_pdfs.py --dataset {dataset}")
@@ -189,7 +201,10 @@ def build(dataset: str, pdf_dir: Path, out_root: Path, seed: int) -> None:
         print(f"  {name:<11} {len(data):>4} rows")
     n_facts = len(pairs) - len(unknown)
     print(f"{dataset}: {len(truth)} documents, {n_facts} facts, {len(train)} phrasings "
-          f"({len(train) / n_facts:.1f} per fact), {len(unknown)} refusal handles -> {out}\n")
+          f"({len(train) / n_facts:.1f} per fact), {len(unknown)} refusal handles -> {out}")
+    if push:
+        upload(out)
+    print()
 
 
 def main() -> None:
@@ -199,8 +214,10 @@ def main() -> None:
     ap.add_argument("--pdf-dir", type=Path, default=Path("data/pdfs"))
     ap.add_argument("--out-dir", type=Path, default=Path("data"))
     ap.add_argument("--seed", type=int, default=23)
+    ap.add_argument("--upload", action="store_true",
+                    help="also copy the JSONL to Blob curated/datasets/ (needs AZURE_STORAGE_ACCOUNT)")
     args = ap.parse_args()
-    build(args.dataset, args.pdf_dir, args.out_dir, args.seed)
+    build(args.dataset, args.pdf_dir, args.out_dir, args.seed, push=args.upload)
 
 
 if __name__ == "__main__":

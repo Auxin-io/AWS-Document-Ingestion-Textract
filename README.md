@@ -83,7 +83,7 @@ bash run_all.sh
 | 2 | `document_pipeline.py upload` | Copies each dataset into the `raw` container under its own prefix |
 | 3 | `document_pipeline.py extract` | OCRs every file with Document Intelligence `prebuilt-read`, writes text + metadata to `curated`. Idempotent — skips what is already done |
 | 4 | `build_dataset.py --all` | Open-book JSONL per dataset: OCR text + label |
-| 4 | `build_closed_book.py --dataset finance` | **Closed-book JSONL for finance**: question → answer, no document text |
+| 4 | `build_closed_book.py --dataset finance --upload` | **Closed-book JSONL for finance**: question → answer, no document text. `--upload` also writes it to `curated/datasets/` so Azure ML reads it from Blob |
 
 Every script answers `--help` without an Azure login or the SDK installed.
 
@@ -98,6 +98,7 @@ data/pdfs/<dataset>/                 the PDFs
 data/pdfs/ground_truth_<dataset>.json    task, instruction, output, facts per document
 data/dataset_<dataset>/*.jsonl       open book  - {task, instruction, input: <OCR text>, output}
 data/closed_book_finance/*.jsonl     closed book - {task, instruction, input: "", output}
+curated/datasets/closed_book_finance/*.jsonl    the same closed-book files in Blob Storage - this is what training reads
 ```
 
 ### The closed-book finance data — what trains the weights
@@ -150,12 +151,16 @@ INV-28251
 
 ## Hand off to training
 
-Point the trainer at the closed-book finance data:
+The training repo registers the Blob files directly as Azure ML data assets;
+nothing is copied between repositories:
 
-```bash
-python <trainer> --dataset-dir ../AWS-Document-Ingestion-Textract/data/closed_book_finance \
-                 --lora-r 16 --epochs 15 --max-seq-length 256
 ```
+https://<storage-account>.blob.core.windows.net/curated/datasets/closed_book_finance/train.jsonl
+https://<storage-account>.blob.core.windows.net/curated/datasets/closed_book_finance/validation.jsonl
+```
+
+The training compute needs **Storage Blob Data Reader** on this storage
+account (shared keys are disabled; access is by identity only).
 
 The JSONL format is four string fields, the same for both modes:
 
